@@ -21,6 +21,7 @@ import com.google.appinventor.server.project.CommonProjectService;
 import com.google.appinventor.server.project.utils.Security;
 import com.google.appinventor.server.properties.json.ServerJsonParser;
 import com.google.appinventor.server.storage.StorageIo;
+import com.google.appinventor.server.util.UriBuilder;
 import com.google.appinventor.shared.properties.json.JSONParser;
 import com.google.appinventor.shared.rpc.RpcResult;
 import com.google.appinventor.shared.rpc.ServerLayout;
@@ -52,6 +53,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.google.common.io.CharStreams;
+import java.util.Locale;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -80,12 +82,17 @@ import java.util.logging.Logger;
  */
 public final class YoungAndroidProjectService extends CommonProjectService {
 
-  private static int currentProgress = 0;
   private static final Logger LOG = Logger.getLogger(YoungAndroidProjectService.class.getName());
+  private static final int MB = 1024 * 1024;
 
   // The value of this flag can be changed in appengine-web.xml
   private static final Flag<Boolean> sendGitVersion =
     Flag.createFlag("build.send.git.version", true);
+
+  private static final Flag<Integer> MAX_PROJECT_SIZE =
+      Flag.createFlag("project.maxsize", 30);
+  private static final String ERROR_LARGE_PROJECT =
+      "Sorry, can't package projects larger than %1$d MB. Yours is %2$3.2f MB.";
 
   // Project folder prefixes
   public static final String SRC_FOLDER = YoungAndroidSourceAnalyzer.SRC_FOLDER;
@@ -643,6 +650,17 @@ public final class YoungAndroidProjectService extends CommonProjectService {
   }
 
   /**
+   * Constructs a RpcResult object that indicates that a file was too big to send.
+   *
+   * @param size size of the aia
+   * @return a new RpcResult with information for rendering an error in the client
+   */
+  private RpcResult fileTooBigResult(double size) {
+    return new RpcResult(413, "", String.format(Locale.getDefault(),
+        "{\"maxSize\":%d,\"aiaSize\":%f}", MAX_PROJECT_SIZE.get(), size / MB));
+  }
+
+  /**
    * Make a request to the Build Server to build a project.  The Build Server will asynchronously
    * post the results of the build via the {@link com.google.appinventor.server.ReceiveBuildServlet}
    * A later call will need to be made by the client in order to get those results.
@@ -656,7 +674,7 @@ public final class YoungAndroidProjectService extends CommonProjectService {
    */
   @Override
   public RpcResult build(User user, long projectId, String nonce, String target,
-    boolean secondBuildserver) {
+    boolean secondBuildserver, boolean isAab) {
     String userId = user.getUserId();
     String projectName = storageIo.getProjectName(userId, projectId);
     String outputFileDir = BUILD_FOLDER + '/' + target;
@@ -679,7 +697,8 @@ public final class YoungAndroidProjectService extends CommonProjectService {
           userId,
           projectId,
           secondBuildserver,
-          outputFileDir));
+          outputFileDir,
+          isAab));
       HttpURLConnection connection = (HttpURLConnection) buildServerUrl.openConnection();
       connection.setDoOutput(true);
       connection.setRequestMethod("POST");
@@ -697,16 +716,8 @@ public final class YoungAndroidProjectService extends CommonProjectService {
       // Keep in mind that large projects can lead to large APK files which
       // may not be loadable into many memory restricted devices, so we
       // may not want to encourage large projects...
-      if (zipFile.getContent().length > 10*1024*1024) { // 10 Megabyte size limit...
-        int zipFileLength = zipFile.getContent().length;
-        String lengthMbs = format((zipFileLength * 1.0)/(1024*1024));
-        RuntimeException exception = new RuntimeException(
-            "Sorry, can't package projects larger than 10Mb."
-            + " Yours is " + lengthMbs + "MB.");
-        CrashReport.createAndLogError(LOG, null,
-            buildErrorMsg("RuntimeException", buildServerUrl, userId, projectId),
-            exception);
-        return new RpcResult(false, "", exception.getMessage());
+      if (zipFile.getContent().length > MAX_PROJECT_SIZE.get() * MB) {
+        return fileTooBigResult(zipFile.getContent().length);
       }
       bufferedOutputStream.write(zipFile.getContent());
       bufferedOutputStream.flush();
@@ -763,17 +774,12 @@ public final class YoungAndroidProjectService extends CommonProjectService {
       return new RpcResult(false, "", e.getMessage());
     } catch (IOException e) {
       // As of App Engine 1.9.0 we get these when UrlFetch is asked to send too much data
-      Throwable wrappedException = e;
       int zipFileLength = zipFile == null ? -1 : zipFile.getContent().length;
-      if (zipFileLength >= (5 * 1024 * 1024) /* 5 MB */) {
-        String lengthMbs = format((zipFileLength * 1.0)/(1024*1024));
-        wrappedException = new IllegalArgumentException(
-          "Sorry, can't package projects larger than 5MB."
-          + " Yours is " + lengthMbs + "MB.", e);
+      if (zipFileLength >= MAX_PROJECT_SIZE.get() * MB) {
+        return fileTooBigResult(zipFileLength);
+      } else {
+        return new RpcResult(false, "", e.getMessage());
       }
-      CrashReport.createAndLogError(LOG, null,
-          buildErrorMsg("IOException", buildServerUrl, userId, projectId), wrappedException);
-      return new RpcResult(false, "", wrappedException.getMessage());
     } catch (EncryptionException e) {
       CrashReport.createAndLogError(LOG, null,
           buildErrorMsg("EncryptionException", buildServerUrl, userId, projectId), e);
@@ -784,27 +790,26 @@ public final class YoungAndroidProjectService extends CommonProjectService {
       Throwable wrappedException = e;
       if (e instanceof ApiProxy.RequestTooLargeException && zipFile != null) {
         int zipFileLength = zipFile.getContent().length;
-        if (zipFileLength >= (5 * 1024 * 1024) /* 5 MB */) {
-          String lengthMbs = format((zipFileLength * 1.0)/(1024*1024));
-          wrappedException = new IllegalArgumentException(
-              "Sorry, can't package projects larger than 5MB."
-              + " Yours is " + lengthMbs + "MB.", e);
+        if (zipFileLength >= MAX_PROJECT_SIZE.get() * MB) {
+          return fileTooBigResult(zipFileLength);
         } else {
           wrappedException = new IllegalArgumentException(
               "Sorry, project was too large to package (" + zipFileLength + " bytes)");
         }
+      } else {
+        // Unexpected runtime error
+        CrashReport.createAndLogError(LOG, null,
+            buildErrorMsg("RuntimeException", buildServerUrl, userId, projectId), wrappedException);
       }
-      CrashReport.createAndLogError(LOG, null,
-          buildErrorMsg("RuntimeException", buildServerUrl, userId, projectId), wrappedException);
       return new RpcResult(false, "", wrappedException.getMessage());
     }
     return new RpcResult(true, "Building " + projectName, "");
   }
 
   String buildErrorMsg(String exceptionName, URL buildURL, String userId, long projectId) {
-    return "Request to build failed with " + exceptionName 
-      + ", user=" + userId + ", project=" + projectId 
-      + ", build URL is " + (buildURL != null ? buildURL : "null") + " [" 
+    return "Request to build failed with " + exceptionName
+      + ", user=" + userId + ", project=" + projectId
+      + ", build URL is " + (buildURL != null ? buildURL : "null") + " ["
       + (buildURL != null ? buildURL.toString().length() : "n/a") + "]";
   }
 
@@ -812,21 +817,23 @@ public final class YoungAndroidProjectService extends CommonProjectService {
   // a little more complicated when we want to get the URL from an App Engine config file or
   // command line argument.
   private String getBuildServerUrlStr(String userName, String userId,
-    long projectId, boolean secondBuildserver, String fileName)
-      throws UnsupportedEncodingException, EncryptionException {
-    return "http://" + (secondBuildserver ? buildServerHost2.get() : buildServerHost.get()) +
-      "/buildserver/build-all-from-zip-async"
-      + "?uname=" + URLEncoder.encode(userName, "UTF-8")
-      + (sendGitVersion.get()
-        ? "&gitBuildVersion="
-        + URLEncoder.encode(GitBuildId.getVersion(), "UTF-8")
-        : "")
-      + "&callback="
-      + URLEncoder.encode("http://" + getCurrentHost() + ServerLayout.ODE_BASEURL_NOAUTH
-        + ServerLayout.RECEIVE_BUILD_SERVLET + "/"
-        + Security.encryptUserAndProjectId(userId, projectId)
-        + "/" + fileName,
-        "UTF-8");
+    long projectId, boolean secondBuildserver, String fileName, boolean isAab)
+      throws EncryptionException {
+    UriBuilder uriBuilder = new UriBuilder(
+        "http://" +
+        (secondBuildserver ? buildServerHost2.get() : buildServerHost.get()) +
+        "/buildserver/build-all-from-zip-async"
+    )
+        .add("uname", userName)
+        .add("callback", "http://" + getCurrentHost() + ServerLayout.ODE_BASEURL_NOAUTH +
+            ServerLayout.RECEIVE_BUILD_SERVLET + "/" +
+            Security.encryptUserAndProjectId(userId, projectId) + "/" +
+            fileName)
+        .add("ext", isAab ? "aab" : "apk");
+    if (sendGitVersion.get()) {
+      uriBuilder.add("gitBuildVersion", GitBuildId.getVersion());
+    }
+    return uriBuilder.build();
   }
 
   private String getCurrentHost() {
@@ -877,8 +884,9 @@ public final class YoungAndroidProjectService extends CommonProjectService {
     String userId = user.getUserId();
     String buildOutputFileName = BUILD_FOLDER + '/' + target + '/' + "build.out";
     List<String> outputFiles = storageIo.getProjectOutputFiles(userId, projectId);
-    updateCurrentProgress(user, projectId, target);
-    RpcResult buildResult = new RpcResult(-1, ""+currentProgress, ""); // Build not finished
+    RpcResult buildResult = new RpcResult(-1,
+        Integer.toString(getCurrentProgress(user, projectId, target)),
+        ""); // Build not finished
     for (String outputFile : outputFiles) {
       if (buildOutputFileName.equals(outputFile)) {
         String outputStr = storageIo.downloadFile(userId, projectId, outputFile, "UTF-8");
@@ -904,13 +912,7 @@ public final class YoungAndroidProjectService extends CommonProjectService {
    * @param projectId  project id to be built
    * @param target  build target (optional, implementation dependent)
    */
-  public void updateCurrentProgress(User user, long projectId, String target) {
-    currentProgress = storageIo.getBuildStatus(user.getUserId(), projectId);
-  }
-
-  // Nicely format floating number using only two decimal places
-  private String format(double input) {
-    DecimalFormat formatter = new DecimalFormat("###.##");
-    return formatter.format(input);
+  public int getCurrentProgress(User user, long projectId, String target) {
+    return storageIo.getBuildStatus(user.getUserId(), projectId);
   }
 }
